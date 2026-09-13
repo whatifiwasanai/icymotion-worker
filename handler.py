@@ -2,7 +2,7 @@
 handler.py -- RunPod Serverless worker for the Icymotion Wan2.1/ComfyUI pipeline.
 
 Flow per worker initialization:
-  1. (start_background) sync models from R2, launch ComfyUI as a background process
+  1. Sync models from R2, launch ComfyUI as a background process
 
 Flow per request:
   1. load the API-format workflow JSON (baked into the image OR passed in the request)
@@ -224,7 +224,6 @@ def handler(event):
 
 
 if __name__ == "__main__":
-    runpod.serverless.start({
-        "handler": handler,
-        "start_background": init_worker
-    })
+    # Run container startup sequence before starting the RunPod listener loop
+    init_worker()
+    runpod.serverless.start({"handler": handler})
