@@ -1,12 +1,14 @@
 """
 handler.py -- RunPod Serverless worker for the Icymotion Wan2.1/ComfyUI pipeline.
 
+Flow per worker initialization:
+  1. (start_background) sync models from R2, launch ComfyUI as a background process
+
 Flow per request:
-  1. (cold start only) sync models from R2, launch ComfyUI as a background process
-  2. load the API-format workflow JSON (baked into the image OR passed in the request)
-  3. patch a handful of node inputs (prompt text, reference image URL, driving video URL)
-  4. submit to ComfyUI's /prompt endpoint, poll /history until done
-  5. locate the output video file, upload it to R2, return the object's URL
+  1. load the API-format workflow JSON (baked into the image OR passed in the request)
+  2. patch a handful of node inputs (prompt text, reference image URL, driving video URL)
+  3. submit to ComfyUI's /prompt endpoint, poll /history until done
+  4. locate the output video file, upload it to R2, return the object's URL
 
 Expected request payload:
 {
@@ -54,14 +56,14 @@ OUTPUT_DIR = os.path.join(COMFYUI_PATH, "output")
 INPUT_DIR = os.path.join(COMFYUI_PATH, "input")
 
 _comfy_process = None
-_IS_COLD_STARTED = False
 
 
 # ---------------------------------------------------------------------------
-# Cold start: models + ComfyUI server
+# Worker Initialization (Background Startup)
 # ---------------------------------------------------------------------------
 
 def ensure_models():
+    print("[init] Syncing models from R2...")
     sync_models(max_workers=4)
 
 
@@ -70,7 +72,7 @@ def start_comfyui():
     if _comfy_process is not None and _comfy_process.poll() is None:
         return  # already running
 
-    print("[handler] launching ComfyUI...")
+    print("[init] Launching ComfyUI...")
     _comfy_process = subprocess.Popen(
         [
             "python", "-u", "main.py",
@@ -85,7 +87,7 @@ def start_comfyui():
         try:
             r = requests.get(f"{COMFYUI_URL}/system_stats", timeout=2)
             if r.status_code == 200:
-                print("[handler] ComfyUI is up.")
+                print("[init] ComfyUI is ready and listening.")
                 return
         except requests.exceptions.RequestException:
             pass
@@ -94,7 +96,8 @@ def start_comfyui():
     raise RuntimeError("ComfyUI failed to start within timeout")
 
 
-def cold_start():
+def init_worker():
+    """Executes on worker boot BEFORE taking jobs to satisfy health checks."""
     ensure_models()
     start_comfyui()
 
@@ -208,15 +211,6 @@ def upload_to_r2(local_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def handler(event):
-    global _IS_COLD_STARTED
-
-    # Lazily execute model download and launch ComfyUI on the first job assignment
-    if not _IS_COLD_STARTED:
-        print("[handler] Performing cold start (downloading models & booting ComfyUI)...")
-        cold_start()
-        _IS_COLD_STARTED = True
-        print("[handler] Cold start complete. Processing job.")
-
     job_input = event.get("input", {})
 
     workflow = load_workflow(job_input)
@@ -230,4 +224,7 @@ def handler(event):
 
 
 if __name__ == "__main__":
-    runpod.serverless.start({"handler": handler})
+    runpod.serverless.start({
+        "handler": handler,
+        "start_background": init_worker
+    })
