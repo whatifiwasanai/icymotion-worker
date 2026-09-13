@@ -12,13 +12,13 @@ Expected request payload:
 {
   "input": {
     "prompt": "female, walking, cinematic lighting",   # optional override
-    "reference_image_url": "https://.../ref.jpg",        # optional, downloaded and fed in
-    "driving_video_url": "https://.../drive.mp4",         # optional, downloaded and fed in
+    "reference_image_url": "https://.../ref.jpg",         # optional, downloaded and fed in
+    "driving_video_url": "https://.../drive.mp4",          # optional, downloaded and fed in
     "overrides": {                                        # optional, raw node patches
       "47": {"text": "female, walking, cinematic lighting"}
     },
     "workflow": { ... }                                   # optional: full API-format JSON.
-                                                            # if omitted, WORKFLOW_JSON_PATH is used.
+                                                          # if omitted, WORKFLOW_JSON_PATH is used.
   }
 }
 """
@@ -40,14 +40,12 @@ COMFYUI_PORT = 8188
 COMFYUI_URL = f"http://{COMFYUI_HOST}:{COMFYUI_PORT}"
 
 # Baked-in default workflow (API format). Export this from ComfyUI's
-# "Export (API)" option on a pod that has every custom node installed --
-# see the conversation this was generated from for why it must be that pod.
+# "Export (API)" option on a pod that has every custom node installed.
 WORKFLOW_JSON_PATH = os.environ.get(
     "WORKFLOW_JSON_PATH", os.path.join(COMFYUI_PATH, "workflow_api.json")
 )
 
-# Known node IDs from the current workflow export -- CONFIRM these against
-# your own exported API JSON, they can shift if the graph is edited.
+# Known node IDs from the current workflow export
 NODE_ID_POSITIVE_PROMPT = "47"    # CLIPTextEncode (text="female ")
 NODE_ID_REFERENCE_IMAGE = "81"    # LoadImage
 NODE_ID_DRIVING_VIDEO = "2"       # VHS_LoadVideo
@@ -56,6 +54,7 @@ OUTPUT_DIR = os.path.join(COMFYUI_PATH, "output")
 INPUT_DIR = os.path.join(COMFYUI_PATH, "input")
 
 _comfy_process = None
+_IS_COLD_STARTED = False
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +208,15 @@ def upload_to_r2(local_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def handler(event):
+    global _IS_COLD_STARTED
+
+    # Lazily execute model download and launch ComfyUI on the first job assignment
+    if not _IS_COLD_STARTED:
+        print("[handler] Performing cold start (downloading models & booting ComfyUI)...")
+        cold_start()
+        _IS_COLD_STARTED = True
+        print("[handler] Cold start complete. Processing job.")
+
     job_input = event.get("input", {})
 
     workflow = load_workflow(job_input)
@@ -221,5 +229,5 @@ def handler(event):
     return {"video_url": video_url}
 
 
-cold_start()
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})
