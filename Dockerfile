@@ -40,6 +40,7 @@ RUN pip install --no-cache-dir runpod boto3 requests websocket-client
 COPY handler.py ${COMFYUI_PATH}/handler.py
 COPY download_models.py ${COMFYUI_PATH}/download_models.py
 COPY models_manifest.json ${COMFYUI_PATH}/models_manifest.json
+COPY workflow_api.json ${COMFYUI_PATH}/workflow_api.json
 
 # Model dirs get populated at runtime from R2 (see download_models.py)
 RUN mkdir -p models/diffusion_models models/text_encoders models/vae models/loras \
