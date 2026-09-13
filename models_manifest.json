@@ -1,0 +1,50 @@
+{
+  "_comment": "local_path is relative to the ComfyUI root. r2_key is the object key in your R2 bucket. Edit r2_key values to match how you actually uploaded these files to R2 -- these are placeholders based on filenames seen in your workflow.",
+  "files": [
+    {
+      "local_path": "models/diffusion_models/wan2.1_14B_SCAIL_2_fp8_scaled.safetensors",
+      "r2_key": "models/diffusion_models/wan2.1_14B_SCAIL_2_fp8_scaled.safetensors"
+    },
+    {
+      "local_path": "models/checkpoints/sam3.1_multiplex_fp16.safetensors",
+      "r2_key": "models/checkpoints/sam3.1_multiplex_fp16.safetensors"
+    },
+    {
+      "local_path": "models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "r2_key": "models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+    },
+    {
+      "local_path": "models/clip_vision/clip_vision_h.safetensors",
+      "r2_key": "models/clip_vision/clip_vision_h.safetensors"
+    },
+    {
+      "local_path": "models/vae/wan_2.1_vae.safetensors",
+      "r2_key": "models/vae/wan_2.1_vae.safetensors"
+    },
+    {
+      "local_path": "models/upscale_models/4x-UltraSharp.pth",
+      "r2_key": "models/upscale_models/4x-UltraSharp.pth"
+    },
+    {
+      "local_path": "models/loras/MyWanLora_combo_20260830_234419.safetensors",
+      "r2_key": "models/loras/MyWanLora_combo_20260830_234419.safetensors"
+    },
+    {
+      "local_path": "models/loras/wan2.1_SCAIL_2_DPO_lora_bf16.safetensors",
+      "r2_key": "models/loras/wan2.1_SCAIL_2_DPO_lora_bf16.safetensors"
+    },
+    {
+      "local_path": "models/loras/wan2.1_t2v_14b_lora_rank64_lightx2v_4step.safetensors",
+      "r2_key": "models/loras/wan2.1_t2v_14b_lora_rank64_lightx2v_4step.safetensors"
+    },
+    {
+      "_comment": "Krea2 workflow's UNETLoader widget expects 'Krea2\\krea2_turbo_fp8_scaled.safetensors' -- i.e. a Krea2 subfolder under wherever UNETLoader scans. On the pod this file currently sits in models/unet/ with NO subfolder, which doesn't match. Placing it here on the serverless side to match what the workflow actually asks for -- verify on the pod whether it's actually resolving correctly there too, since it may be relying on a folder alias.",
+      "local_path": "models/diffusion_models/Krea2/krea2_turbo_fp8_scaled.safetensors",
+      "r2_key": "models/unet/krea2_turbo_fp8_scaled.safetensors"
+    },
+    {
+      "local_path": "models/vae/qwen_image_vae.safetensors",
+      "r2_key": "models/vae/qwen_image_vae.safetensors"
+    }
+  ]
+}
