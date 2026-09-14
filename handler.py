@@ -1,5 +1,14 @@
-import os
 import sys
+print(f"[debug] Executable: {sys.executable}", flush=True)
+print(f"[debug] Version: {sys.version}", flush=True)
+
+try:
+    import requests
+    print(f"[debug] requests OK: {requests.__version__}", flush=True)
+except Exception as e:
+    print(f"[debug] requests import failed: {repr(e)}", flush=True)
+
+import os
 import time
 import json
 import uuid
@@ -112,15 +121,12 @@ def handler(job):
     with open(WORKFLOW_FILE, "r") as f:
         workflow = json.load(f)
 
-    # 1. Video Input Handling
     if "video_url" in job_input:
         video_filename = f"input_video_{uuid.uuid4().hex[:8]}.mp4"
         download_input_file(job_input["video_url"], video_filename)
-        # Target node 47 (LoadVideo) or equivalent load node
         if "47" in workflow:
             workflow["47"]["inputs"]["video"] = video_filename
 
-    # 2. Key Prompts and Parameters
     if "prompt" in job_input:
         if "6" in workflow:
             workflow["6"]["inputs"]["text"] = job_input["prompt"]
@@ -133,11 +139,9 @@ def handler(job):
         if "3" in workflow:
             workflow["3"]["inputs"]["seed"] = job_input["seed"]
 
-    # 3. Execute Workflow
     print("[handler] Executing ComfyUI workflow...")
     outputs = process_workflow(workflow)
 
-    # 4. Process Output files and push to R2
     uploaded_urls = []
     output_dir = os.path.join(COMFYUI_PATH, "output")
 
@@ -168,7 +172,7 @@ def init_worker():
     print("[init] Starting ComfyUI server in background...")
     import subprocess
     subprocess.Popen(
-        ["python3", "main.py", "--listen", "127.0.0.1", "--port", "8188"],
+        ["python3.11", "main.py", "--listen", "127.0.0.1", "--port", "8188"],
         cwd=COMFYUI_PATH
     )
 
