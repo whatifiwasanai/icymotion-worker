@@ -27,4 +27,6 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/icymotion-worker:latest
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/icymotion-worker:v1.0.1
+            ${{ secrets.DOCKERHUB_USERNAME }}/icymotion-worker:latest
