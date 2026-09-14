@@ -1,229 +1,179 @@
-"""
-handler.py -- RunPod Serverless worker for the Icymotion Wan2.1/ComfyUI pipeline.
-
-Flow per worker initialization:
-  1. Sync models from R2, launch ComfyUI as a background process
-
-Flow per request:
-  1. load the API-format workflow JSON (baked into the image OR passed in the request)
-  2. patch a handful of node inputs (prompt text, reference image URL, driving video URL)
-  3. submit to ComfyUI's /prompt endpoint, poll /history until done
-  4. locate the output video file, upload it to R2, return the object's URL
-
-Expected request payload:
-{
-  "input": {
-    "prompt": "female, walking, cinematic lighting",   # optional override
-    "reference_image_url": "https://.../ref.jpg",         # optional, downloaded and fed in
-    "driving_video_url": "https://.../drive.mp4",          # optional, downloaded and fed in
-    "overrides": {                                        # optional, raw node patches
-      "47": {"text": "female, walking, cinematic lighting"}
-    },
-    "workflow": { ... }                                   # optional: full API-format JSON.
-                                                          # if omitted, WORKFLOW_JSON_PATH is used.
-  }
-}
-"""
-
 import os
-import io
-import json
+import sys
 import time
+import json
 import uuid
-import requests
+import boto3
+import urllib.request
+import urllib.parse
+import websocket
 import runpod
-import subprocess
-
 from download_models import sync_models
 
 COMFYUI_PATH = os.environ.get("COMFYUI_PATH", "/comfyui")
-COMFYUI_HOST = "127.0.0.1"
-COMFYUI_PORT = 8188
-COMFYUI_URL = f"http://{COMFYUI_HOST}:{COMFYUI_PORT}"
+COMFY_HOST = "127.0.0.1:8188"
+WORKFLOW_FILE = os.path.join(COMFYUI_PATH, "workflow_api.json")
 
-# Baked-in default workflow (API format). Export this from ComfyUI's
-# "Export (API)" option on a pod that has every custom node installed.
-WORKFLOW_JSON_PATH = os.environ.get(
-    "WORKFLOW_JSON_PATH", os.path.join(COMFYUI_PATH, "workflow_api.json")
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
+R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "")
+
+R2_ENDPOINT_URL = os.environ.get(
+    "R2_ENDPOINT_URL",
+    f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
 )
 
-# Known node IDs from the current workflow export
-NODE_ID_POSITIVE_PROMPT = "47"    # CLIPTextEncode (text="female ")
-NODE_ID_REFERENCE_IMAGE = "81"    # LoadImage
-NODE_ID_DRIVING_VIDEO = "2"       # VHS_LoadVideo
-
-OUTPUT_DIR = os.path.join(COMFYUI_PATH, "output")
-INPUT_DIR = os.path.join(COMFYUI_PATH, "input")
-
-_comfy_process = None
-
-
-# ---------------------------------------------------------------------------
-# Worker Initialization (Background Startup)
-# ---------------------------------------------------------------------------
-
-def ensure_models():
-    print("[init] Syncing models from R2...")
-    sync_models(max_workers=4)
-
-
-def start_comfyui():
-    global _comfy_process
-    if _comfy_process is not None and _comfy_process.poll() is None:
-        return  # already running
-
-    print("[init] Launching ComfyUI...")
-    _comfy_process = subprocess.Popen(
-        [
-            "python", "-u", "main.py",
-            "--listen", COMFYUI_HOST,
-            "--port", str(COMFYUI_PORT),
-        ],
-        cwd=COMFYUI_PATH,
-    )
-
-    # Wait for the server to come up
-    for _ in range(180):  # up to ~3 minutes
-        try:
-            r = requests.get(f"{COMFYUI_URL}/system_stats", timeout=2)
-            if r.status_code == 200:
-                print("[init] ComfyUI is ready and listening.")
-                return
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(1)
-
-    raise RuntimeError("ComfyUI failed to start within timeout")
-
-
-def init_worker():
-    """Executes on worker boot BEFORE taking jobs to satisfy health checks."""
-    ensure_models()
-    start_comfyui()
-
-
-# ---------------------------------------------------------------------------
-# Request-time helpers
-# ---------------------------------------------------------------------------
-
-def download_to_input(url: str, filename: str) -> str:
-    """Download a reference image / driving video from a URL into ComfyUI's input dir."""
-    os.makedirs(INPUT_DIR, exist_ok=True)
-    local_path = os.path.join(INPUT_DIR, filename)
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with open(local_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
-    return filename  # ComfyUI LoadImage/VHS_LoadVideo take just the filename
-
-
-def load_workflow(job_input: dict) -> dict:
-    if "workflow" in job_input:
-        return job_input["workflow"]
-    with open(WORKFLOW_JSON_PATH) as f:
-        return json.load(f)
-
-
-def apply_overrides(workflow: dict, job_input: dict) -> dict:
-    if "prompt" in job_input:
-        workflow.setdefault(NODE_ID_POSITIVE_PROMPT, {}).setdefault("inputs", {})["text"] = job_input["prompt"]
-
-    if "reference_image_url" in job_input:
-        fname = download_to_input(job_input["reference_image_url"], f"ref_{uuid.uuid4().hex}.jpg")
-        workflow.setdefault(NODE_ID_REFERENCE_IMAGE, {}).setdefault("inputs", {})["image"] = fname
-
-    if "driving_video_url" in job_input:
-        fname = download_to_input(job_input["driving_video_url"], f"drive_{uuid.uuid4().hex}.mp4")
-        workflow.setdefault(NODE_ID_DRIVING_VIDEO, {}).setdefault("inputs", {})["video"] = fname
-
-    # Raw escape hatch: {"overrides": {"<node_id>": {"<input_name>": <value>}}}
-    for node_id, patch in job_input.get("overrides", {}).items():
-        workflow.setdefault(node_id, {}).setdefault("inputs", {}).update(patch)
-
-    return workflow
-
-
-def submit_and_wait(workflow: dict, poll_interval: float = 2.0, timeout: int = 3600) -> dict:
-    client_id = uuid.uuid4().hex
-    resp = requests.post(
-        f"{COMFYUI_URL}/prompt",
-        json={"prompt": workflow, "client_id": client_id},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    prompt_id = resp.json()["prompt_id"]
-    print(f"[handler] queued prompt_id={prompt_id}")
-
-    start = time.time()
-    while time.time() - start < timeout:
-        h = requests.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=10).json()
-        if prompt_id in h:
-            status = h[prompt_id].get("status", {})
-            if status.get("completed"):
-                return h[prompt_id]
-            if status.get("status_str") == "error":
-                raise RuntimeError(f"ComfyUI execution failed: {status}")
-        time.sleep(poll_interval)
-
-    raise TimeoutError(f"Prompt {prompt_id} did not finish within {timeout}s")
-
-
-def find_output_video(history_entry: dict) -> str:
-    """Walk the history's outputs for the first saved video file."""
-    outputs = history_entry.get("outputs", {})
-    for node_id, node_output in outputs.items():
-        for key in ("gifs", "videos"):  # VHS_VideoCombine reports under 'gifs' in older builds
-            for item in node_output.get(key, []):
-                fname = item.get("filename")
-                subfolder = item.get("subfolder", "")
-                if fname and fname.lower().endswith((".mp4", ".webm")):
-                    return os.path.join(OUTPUT_DIR, subfolder, fname)
-    raise FileNotFoundError("No output video found in ComfyUI history for this prompt")
-
-
-def upload_to_r2(local_path: str) -> str:
-    import boto3
-    from botocore.config import Config
-
-    account_id = os.environ["R2_ACCOUNT_ID"]
-    bucket = os.environ["R2_BUCKET_NAME"]
-    s3 = boto3.client(
+def get_r2_client():
+    return boto3.client(
         "s3",
-        endpoint_url=os.environ.get("R2_ENDPOINT_URL", f"https://{account_id}.r2.cloudflarestorage.com"),
-        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-        config=Config(signature_version="s3v4"),
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
         region_name="auto",
     )
 
-    key = f"outputs/{uuid.uuid4().hex}_{os.path.basename(local_path)}"
-    s3.upload_file(local_path, bucket, key)
+def upload_file_to_r2(local_path, r2_key):
+    s3_client = get_r2_client()
+    s3_client.upload_file(local_path, R2_BUCKET_NAME, r2_key)
+    if R2_PUBLIC_URL:
+        base = R2_PUBLIC_URL.rstrip("/")
+        return f"{base}/{r2_key}"
+    return f"https://{R2_BUCKET_NAME}.r2.cloudflarestorage.com/{r2_key}"
 
-    public_base = os.environ.get("R2_PUBLIC_BASE_URL")  # e.g. your R2 public bucket domain / CDN
-    if public_base:
-        return f"{public_base.rstrip('/')}/{key}"
-    return f"r2://{bucket}/{key}"  # caller resolves via their own R2 access if no public base configured
+def download_input_file(url, filename):
+    input_dir = os.path.join(COMFYUI_PATH, "input")
+    os.makedirs(input_dir, exist_ok=True)
+    local_path = os.path.join(input_dir, filename)
+    print(f"[handler] Downloading input file from {url} to {local_path}")
+    urllib.request.urlretrieve(url, local_path)
+    return filename
 
+def wait_for_comfyui():
+    url = f"http://{COMFY_HOST}/system_stats"
+    for i in range(60):
+        try:
+            req = urllib.request.urlopen(url)
+            if req.getcode() == 200:
+                print("[handler] ComfyUI is ready!")
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    raise RuntimeError("ComfyUI server failed to start within timeout.")
 
-# ---------------------------------------------------------------------------
-# RunPod entrypoint
-# ---------------------------------------------------------------------------
+def queue_prompt(prompt, client_id):
+    p = {"prompt": prompt, "client_id": client_id}
+    data = json.dumps(p).encode("utf-8")
+    req = urllib.request.Request(f"http://{COMFY_HOST}/prompt", data=data, headers={"Content-Type": "application/json"})
+    response = urllib.request.urlopen(req)
+    return json.loads(response.read().decode("utf-8"))
 
-def handler(event):
-    job_input = event.get("input", {})
+def track_execution(prompt_id, client_id):
+    ws = websocket.WebSocket()
+    ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}")
+    outputs = {}
 
-    workflow = load_workflow(job_input)
-    workflow = apply_overrides(workflow, job_input)
+    while True:
+        out = ws.recv()
+        if isinstance(out, str):
+            message = json.loads(out)
+            msg_type = message.get("type")
+            data = message.get("data", {})
 
-    history_entry = submit_and_wait(workflow)
-    video_path = find_output_video(history_entry)
-    video_url = upload_to_r2(video_path)
+            if msg_type == "executing":
+                if data.get("node") is None and data.get("prompt_id") == prompt_id:
+                    break
+            elif msg_type == "executed":
+                if data.get("prompt_id") == prompt_id:
+                    node_id = data.get("node")
+                    outputs[node_id] = data.get("output", {})
 
-    return {"video_url": video_url}
+    ws.close()
+    return outputs
 
+def process_workflow(prompt_data):
+    client_id = str(uuid.uuid4())
+    res = queue_prompt(prompt_data, client_id)
+    prompt_id = res.get("prompt_id")
+    if not prompt_id:
+        raise RuntimeError(f"Failed to queue prompt: {res}")
+
+    print(f"[handler] Queued workflow prompt_id={prompt_id}")
+    outputs = track_execution(prompt_id, client_id)
+    return outputs
+
+def handler(job):
+    job_input = job.get("input", {})
+    if not job_input:
+        return {"error": "No input provided"}
+
+    with open(WORKFLOW_FILE, "r") as f:
+        workflow = json.load(f)
+
+    # 1. Video Input Handling
+    if "video_url" in job_input:
+        video_filename = f"input_video_{uuid.uuid4().hex[:8]}.mp4"
+        download_input_file(job_input["video_url"], video_filename)
+        # Target node 47 (LoadVideo) or equivalent load node
+        if "47" in workflow:
+            workflow["47"]["inputs"]["video"] = video_filename
+
+    # 2. Key Prompts and Parameters
+    if "prompt" in job_input:
+        if "6" in workflow:
+            workflow["6"]["inputs"]["text"] = job_input["prompt"]
+
+    if "negative_prompt" in job_input:
+        if "7" in workflow:
+            workflow["7"]["inputs"]["text"] = job_input["negative_prompt"]
+
+    if "seed" in job_input:
+        if "3" in workflow:
+            workflow["3"]["inputs"]["seed"] = job_input["seed"]
+
+    # 3. Execute Workflow
+    print("[handler] Executing ComfyUI workflow...")
+    outputs = process_workflow(workflow)
+
+    # 4. Process Output files and push to R2
+    uploaded_urls = []
+    output_dir = os.path.join(COMFYUI_PATH, "output")
+
+    for node_id, output in outputs.items():
+        if "gifs" in output:
+            for item in output["gifs"]:
+                filename = item.get("filename")
+                subfolder = item.get("subfolder", "")
+                file_path = os.path.join(output_dir, subfolder, filename)
+                r2_key = f"outputs/{uuid.uuid4().hex}_{filename}"
+                url = upload_file_to_r2(file_path, r2_key)
+                uploaded_urls.append(url)
+        if "images" in output:
+            for item in output["images"]:
+                filename = item.get("filename")
+                subfolder = item.get("subfolder", "")
+                file_path = os.path.join(output_dir, subfolder, filename)
+                r2_key = f"outputs/{uuid.uuid4().hex}_{filename}"
+                url = upload_file_to_r2(file_path, r2_key)
+                uploaded_urls.append(url)
+
+    return {"status": "success", "outputs": uploaded_urls}
+
+def init_worker():
+    print("[init] Syncing models from R2...")
+    sync_models(max_workers=4)
+
+    print("[init] Starting ComfyUI server in background...")
+    import subprocess
+    subprocess.Popen(
+        ["python3", "main.py", "--listen", "127.0.0.1", "--port", "8188"],
+        cwd=COMFYUI_PATH
+    )
+
+    wait_for_comfyui()
 
 if __name__ == "__main__":
-    # Run container startup sequence before starting the RunPod listener loop
     init_worker()
     runpod.serverless.start({"handler": handler})
